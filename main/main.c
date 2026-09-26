@@ -7,6 +7,8 @@
 #include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "usb_device_uac.h"
 
 #include "codec/es8311.h"
@@ -22,6 +24,7 @@ static const char *TAG = "usb_mic";
 static i2s_chan_handle_t rx_channel;
 static int16_t stereo[FRAMES_PER_READ * 2];
 static uint32_t read_errors;
+static volatile TickType_t last_usb_capture_tick;
 
 static esp_err_t microphone_input(uint8_t *buffer, size_t length,
                                   size_t *bytes_read, void *context)
@@ -31,6 +34,7 @@ static esp_err_t microphone_input(uint8_t *buffer, size_t length,
     if (length > FRAMES_PER_READ * sizeof(int16_t) || length % sizeof(int16_t)) {
         return ESP_ERR_INVALID_SIZE;
     }
+    last_usb_capture_tick = xTaskGetTickCount();
 
     const size_t frames = length / sizeof(int16_t);
     size_t received = 0;
@@ -39,6 +43,7 @@ static esp_err_t microphone_input(uint8_t *buffer, size_t length,
     if (err != ESP_OK || received != frames * 2 * sizeof(int16_t)) {
         memset(buffer, 0, length);
         *bytes_read = length;
+        display_record_peak(0);
         if (++read_errors % 100 == 1) {
             ESP_LOGW(TAG, "I2S short read: %s, %u/%u bytes",
                      esp_err_to_name(err), (unsigned)received,
@@ -56,11 +61,40 @@ static esp_err_t microphone_input(uint8_t *buffer, size_t length,
     }
     const unsigned channel = energy[1] > energy[0] ? 1 : 0;
     int16_t *mono = (int16_t *)buffer;
+    uint16_t peak = 0;
     for (size_t i = 0; i < frames; ++i) {
         mono[i] = stereo[2 * i + channel];
+        unsigned magnitude = abs((int)mono[i]);
+        if (magnitude > peak) peak = magnitude;
     }
+    display_record_peak(peak);
     *bytes_read = length;
     return ESP_OK;
+}
+
+static void capture_idle_peak(void)
+{
+    // Keep the display reactive even when macOS has not opened the UAC stream.
+    // USB capture has priority and owns I2S while it is active.
+    if ((TickType_t)(xTaskGetTickCount() - last_usb_capture_tick) <
+        pdMS_TO_TICKS(100)) return;
+
+    int16_t samples[FRAMES_PER_READ * 2];
+    size_t received = 0;
+    esp_err_t err = i2s_channel_read(rx_channel, samples, sizeof(samples),
+                                     &received, pdMS_TO_TICKS(20));
+    if (err != ESP_OK || received != sizeof(samples)) return;
+
+    uint32_t energy[2] = {0, 0};
+    uint16_t peak[2] = {0, 0};
+    for (size_t i = 0; i < FRAMES_PER_READ; ++i) {
+        for (unsigned channel = 0; channel < 2; ++channel) {
+            unsigned magnitude = abs((int)samples[2 * i + channel]);
+            energy[channel] += magnitude;
+            if (magnitude > peak[channel]) peak[channel] = magnitude;
+        }
+    }
+    display_record_peak(peak[energy[1] > energy[0] ? 1 : 0]);
 }
 
 static esp_err_t init_audio(void)
@@ -137,7 +171,7 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(uac_device_init(&usb));
     ESP_LOGI(TAG, "USB audio microphone ready");
-    esp_err_t display_result = display_show_microphone();
+    esp_err_t display_result = display_show_microphone(capture_idle_peak);
     if (display_result != ESP_OK) {
         ESP_LOGW(TAG, "status display unavailable: %s",
                  esp_err_to_name(display_result));

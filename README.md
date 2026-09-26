@@ -1,6 +1,6 @@
 # Waveshare ESP32-S3 USB microphone
 
-Standalone USB Audio Class firmware for the Waveshare ESP32-S3 Touch AMOLED 1.8 V2. It streams the board's analog microphone as mono, signed 16-bit PCM at 24 kHz over the ESP32-S3 native USB port. Its CO5300 display shows a static `USB MIC` status screen. A second USB CDC interface accepts a deliberate recovery command for entering ROM download mode. There is no Wi-Fi, speaker output, or dependency on Codex Remote at runtime.
+Standalone USB Audio Class firmware for the Waveshare ESP32-S3 Touch AMOLED 1.8 V2. It streams the board's analog microphone as mono, signed 16-bit PCM at 24 kHz over the ESP32-S3 native USB port. Its CO5300 display shows only a cyan waveform on black, with bar heights driven by the analog microphone. A second USB CDC interface accepts a deliberate recovery command for entering ROM download mode. There is no Wi-Fi, speaker output, or dependency on Codex Remote at runtime.
 
 The project uses ESP-IDF 5.5.5, Espressif's `usb_device_uac` 1.3.1 component, its TinyUSB dependency, and Espressif's CO5300 LCD driver. The ES8311 codec driver is adapted from the Apache-2.0 licensed driver already used by Codex Remote; only its I2C transport was changed from Arduino to ESP-IDF. The USB descriptor callback is adapted from the UAC component's MIT-licensed example so macOS shows `Waveshare USB Microphone` as the input name. The codec runs in analog mic mode with 42 dB gain. I2S RX uses GPIO16 MCLK, GPIO9 BCLK, GPIO45 WS, and GPIO10 DIN; I2C uses GPIO15 SDA and GPIO14 SCL at address 0x18. GPIO46 holds the speaker amplifier off. Each 10 ms stereo I2S block selects the more energetic slot for mono USB output.
 
@@ -39,12 +39,14 @@ Once this composite build is running, use its CDC port to request ROM mode witho
 ```sh
 python tools/enter_bootloader.py
 # The script prints the ROM /dev/cu.usbmodem* port after the device reconnects.
-idf.py -p /dev/cu.usbmodem101 flash
-# If macOS still shows the ROM serial device instead of the microphone:
+idf.py -p /dev/cu.usbmodemXXXX flash  # Use the printed ROM port.
+# If macOS still shows the ROM serial device, or the screen stays black:
 python tools/leave_bootloader.py
 ```
 
 Run the helpers with ESP-IDF's Python environment exported; they require `pyserial` and `esptool`. The command accepted by CDC is exactly `MIC BOOTLOADER` followed by a newline. Opening the port or toggling DTR alone does not request a reboot. `leave_bootloader.py` clears the ESP32-S3 RTC force-download bit, then resets the ROM serial port if necessary. The CDC interface is a control path, not a hardware JTAG endpoint or a log console.
+
+The generated image in `design/waveform-concept.png` is a visual reference; the firmware draws the waveform directly in RGB565. During capture, the USB stream supplies peak levels. When the Mac has not opened the input stream, the display reads the codec to keep the waveform moving.
 
 ## Verify on macOS
 
@@ -66,6 +68,7 @@ Run the helpers with ESP-IDF's Python environment exported; they require `pyseri
 - FFmpeg captured 30 seconds of PCM16 from that input. A spoken test phrase containing “penguins dance in Chicago” was transcribed twice with those words intact (the first word was misheard as “Caffery”). This verifies intelligible speech through the board's physical microphone.
 - The first static display image showed a bright green strip at the right edge. A user photo confirmed it was a layout defect. Waveshare's V2 ESP-IDF example applies a 16-pixel CO5300 horizontal GRAM offset; this project now applies the same offset. Nicolas confirmed the strip disappeared after the corrected image was flashed. The audio input still enumerated, and a 5-second capture from that image was non-silent.
 - The composite image enumerated the same microphone plus a `/dev/cu.usbmodem*` CDC port. CDC `PING` returned `Waveshare USB Microphone`. `enter_bootloader.py` reached the ROM port without physical input; `leave_bootloader.py` returned to the microphone without physical input. A full `enter_bootloader.py` → `idf.py flash` remote update also verified all flashed region hashes and returned to the microphone. FFmpeg captured non-silent audio after that update, and Nicolas confirmed the display still looked correct without the green strip. The ESP-IDF flash run reported a serial-port-disappeared exception after its hash checks because the app re-enumerated; subsequent USB, CDC, audio, and display checks passed.
+- The waveform image built and flashed successfully. macOS still showed the microphone and CDC port; an 8-second capture measured about -28.6 dB mean and -8.8 dB peak. After flashing, the board's screen appeared black even though USB was working. A remote `enter_bootloader.py` → `leave_bootloader.py` restart brought the waveform on. Nicolas confirmed that the screen shows the cyan waveform and that its bars move when he speaks near the board. There is no text or status information on this screen.
 - The original Codex Remote 16 MB flash image was saved outside the repository before flashing, at `~/.local/share/esp32-usb-mic/backups/codex-remote-2026-09-26-full-flash.bin`, with SHA-256 `f3b5dbf5ef70a54169961dc5cf7241aa75d5b0fbfe4c49b0d4ae70762c61fd94`. Treat that backup as sensitive because it includes NVS.
 
 ## Rollback
@@ -85,3 +88,4 @@ Reset or reconnect the board afterward. A full-flash restore also restores the o
 - This macOS-targeted UAC configuration follows Espressif's `UAC_SUPPORT_MACOS` option, which its documentation says may prevent Windows recognition.
 - Hardware USB Serial/JTAG cannot coexist with USB audio on the board's single internal PHY. The composite CDC control interface does not expose hardware JTAG or application logs.
 - The physical V2 board identification follows the prior successful Codex Remote deployment, not a fresh rear-label inspection.
+- The battery-powered board may leave the display black immediately after a remote flash. The CDC recovery and return scripts restored it in the observed session; a cold power cycle is the manual fallback.
