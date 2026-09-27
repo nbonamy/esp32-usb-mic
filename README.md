@@ -48,6 +48,12 @@ Run the helpers with ESP-IDF's Python environment exported; they require `pyseri
 
 The generated image in `design/waveform-concept.png` is a visual reference; the firmware draws the waveform directly in RGB565. During capture, the USB stream supplies peak levels. When the Mac has not opened the input stream, the display reads the codec to keep the waveform moving.
 
+## Pause for battery life
+
+Short-press the board's physical **BOOT** button while it is running. The microphone then stops sampling: its codec input is powered down, the I2S channel and clocks stop, and the AMOLED panel is switched off. The USB microphone remains connected to the Mac but supplies silence to an app that continues recording. Short-press **BOOT** again to resume microphone capture and the waveform. Holding BOOT while starting the board still enters ROM download mode.
+
+This is a reversible pause, not a full board shutdown. USB and the ESP32-S3 remain awake so the device stays selectable on the Mac and can respond to BOOT. Battery-current reduction has not yet been measured.
+
 ## Verify on macOS
 
 1. In **System Information → USB**, confirm `Waveshare USB Microphone` (`303A:8000`). In **Audio MIDI Setup** or **System Settings → Sound → Input**, confirm one input channel at 24 kHz. There is no audio output endpoint. A `/dev/cu.usbmodem*` CDC control port should also appear.
@@ -89,3 +95,4 @@ Reset or reconnect the board afterward. A full-flash restore also restores the o
 - Hardware USB Serial/JTAG cannot coexist with USB audio on the board's single internal PHY. The composite CDC control interface does not expose hardware JTAG or application logs.
 - The physical V2 board identification follows the prior successful Codex Remote deployment, not a fresh rear-label inspection.
 - The battery-powered board may leave the display black immediately after a remote flash. The CDC recovery and return scripts restored it in the observed session; a cold power cycle is the manual fallback.
+- The BOOT pause control builds for the V2 target, but it has not yet been flashed or tested on the physical board. In particular, codec wake and macOS silence while paused still need device verification.

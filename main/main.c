@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -8,6 +9,7 @@
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "usb_device_uac.h"
 
@@ -22,6 +24,9 @@
 
 static const char *TAG = "usb_mic";
 static i2s_chan_handle_t rx_channel;
+static es8311_handle_t codec;
+static SemaphoreHandle_t audio_lock;
+static bool microphone_paused;
 static int16_t stereo[FRAMES_PER_READ * 2];
 static uint32_t read_errors;
 static volatile TickType_t last_usb_capture_tick;
@@ -36,6 +41,14 @@ static esp_err_t microphone_input(uint8_t *buffer, size_t length,
     }
     last_usb_capture_tick = xTaskGetTickCount();
 
+    xSemaphoreTake(audio_lock, portMAX_DELAY);
+    if (microphone_paused) {
+        memset(buffer, 0, length);
+        *bytes_read = length;
+        xSemaphoreGive(audio_lock);
+        return ESP_OK;
+    }
+
     const size_t frames = length / sizeof(int16_t);
     size_t received = 0;
     esp_err_t err = i2s_channel_read(rx_channel, stereo, frames * 2 * sizeof(int16_t),
@@ -49,6 +62,7 @@ static esp_err_t microphone_input(uint8_t *buffer, size_t length,
                      esp_err_to_name(err), (unsigned)received,
                      (unsigned)(frames * 2 * sizeof(int16_t)));
         }
+        xSemaphoreGive(audio_lock);
         return ESP_OK;
     }
 
@@ -69,6 +83,7 @@ static esp_err_t microphone_input(uint8_t *buffer, size_t length,
     }
     display_record_peak(peak);
     *bytes_read = length;
+    xSemaphoreGive(audio_lock);
     return ESP_OK;
 }
 
@@ -79,11 +94,22 @@ static void capture_idle_peak(void)
     if ((TickType_t)(xTaskGetTickCount() - last_usb_capture_tick) <
         pdMS_TO_TICKS(100)) return;
 
+    xSemaphoreTake(audio_lock, portMAX_DELAY);
+    if (microphone_paused ||
+        (TickType_t)(xTaskGetTickCount() - last_usb_capture_tick) <
+            pdMS_TO_TICKS(100)) {
+        xSemaphoreGive(audio_lock);
+        return;
+    }
+
     int16_t samples[FRAMES_PER_READ * 2];
     size_t received = 0;
     esp_err_t err = i2s_channel_read(rx_channel, samples, sizeof(samples),
                                      &received, pdMS_TO_TICKS(20));
-    if (err != ESP_OK || received != sizeof(samples)) return;
+    if (err != ESP_OK || received != sizeof(samples)) {
+        xSemaphoreGive(audio_lock);
+        return;
+    }
 
     uint32_t energy[2] = {0, 0};
     uint16_t peak[2] = {0, 0};
@@ -95,10 +121,47 @@ static void capture_idle_peak(void)
         }
     }
     display_record_peak(peak[energy[1] > energy[0] ? 1 : 0]);
+    xSemaphoreGive(audio_lock);
+}
+
+static esp_err_t set_microphone_paused(bool paused)
+{
+    xSemaphoreTake(audio_lock, portMAX_DELAY);
+    if (microphone_paused == paused) {
+        xSemaphoreGive(audio_lock);
+        return ESP_OK;
+    }
+
+    if (paused) {
+        // Refuse all further capture before touching the codec or I2S clocks.
+        microphone_paused = true;
+        esp_err_t codec_result = es8311_microphone_power_set(codec, false);
+        esp_err_t i2s_result = i2s_channel_disable(rx_channel);
+        if (codec_result != ESP_OK || i2s_result != ESP_OK) {
+            ESP_LOGW(TAG, "pause power-down: codec=%s I2S=%s",
+                     esp_err_to_name(codec_result), esp_err_to_name(i2s_result));
+        }
+    } else {
+        esp_err_t err = i2s_channel_enable(rx_channel);
+        if (err == ESP_OK) err = es8311_microphone_power_set(codec, true);
+        if (err != ESP_OK) {
+            i2s_channel_disable(rx_channel);
+            xSemaphoreGive(audio_lock);
+            return err;
+        }
+        microphone_paused = false;
+        last_usb_capture_tick = 0;
+    }
+
+    ESP_LOGI(TAG, "microphone %s", paused ? "paused" : "resumed");
+    xSemaphoreGive(audio_lock);
+    return ESP_OK;
 }
 
 static esp_err_t init_audio(void)
 {
+    audio_lock = xSemaphoreCreateMutex();
+    ESP_RETURN_ON_FALSE(audio_lock, ESP_ERR_NO_MEM, TAG, "audio mutex");
     // GPIO46 enables the speaker amplifier. Keep it off for an input-only device.
     gpio_config_t amp = {
         .pin_bit_mask = 1ULL << GPIO_NUM_46,
@@ -142,7 +205,7 @@ static esp_err_t init_audio(void)
                         TAG, "I2S standard mode");
     ESP_RETURN_ON_ERROR(i2s_channel_enable(rx_channel), TAG, "I2S enable");
 
-    es8311_handle_t codec = es8311_create(I2C_PORT, CODEC_ADDRESS);
+    codec = es8311_create(I2C_PORT, CODEC_ADDRESS);
     ESP_RETURN_ON_FALSE(codec, ESP_ERR_NO_MEM, TAG, "codec handle");
     es8311_clock_config_t clock = {
         .mclk_inverted = false,
@@ -171,7 +234,8 @@ void app_main(void)
     };
     ESP_ERROR_CHECK(uac_device_init(&usb));
     ESP_LOGI(TAG, "USB audio microphone ready");
-    esp_err_t display_result = display_show_microphone(capture_idle_peak);
+    esp_err_t display_result = display_show_microphone(capture_idle_peak,
+                                                       set_microphone_paused);
     if (display_result != ESP_OK) {
         ESP_LOGW(TAG, "status display unavailable: %s",
                  esp_err_to_name(display_result));

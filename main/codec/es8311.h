@@ -166,6 +166,9 @@ esp_err_t es8311_microphone_gain_set(es8311_handle_t dev, es8311_mic_gain_t gain
  */
 esp_err_t es8311_microphone_config(es8311_handle_t dev, bool digital_mic);
 
+/** Power down or restore the analog microphone path without losing codec setup. */
+esp_err_t es8311_microphone_power_set(es8311_handle_t dev, bool enabled);
+
 /**
  * @brief Configure sampling frequency
  *

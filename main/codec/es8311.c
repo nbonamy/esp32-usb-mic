@@ -317,6 +317,19 @@ esp_err_t es8311_microphone_config(es8311_handle_t dev, bool digital_mic)
     return es8311_write_reg(dev, ES8311_SYSTEM_REG14, reg14);
 }
 
+esp_err_t es8311_microphone_power_set(es8311_handle_t dev, bool enabled)
+{
+    if (enabled) {
+        ESP_RETURN_ON_ERROR(es8311_write_reg(dev, ES8311_SYSTEM_REG0D, 0x01),
+                            TAG, "microphone analog power on");
+        return es8311_write_reg(dev, ES8311_SYSTEM_REG0E, 0x02);
+    }
+    // ES8311 standby sequence: power down the PGA/modulator, then analog bias.
+    ESP_RETURN_ON_ERROR(es8311_write_reg(dev, ES8311_SYSTEM_REG0E, 0xFF),
+                        TAG, "microphone ADC power off");
+    return es8311_write_reg(dev, ES8311_SYSTEM_REG0D, 0xFC);
+}
+
 esp_err_t es8311_init(es8311_handle_t dev, const es8311_clock_config_t *const clk_cfg, const es8311_resolution_t res_in, const es8311_resolution_t res_out)
 {
     ESP_RETURN_ON_FALSE(

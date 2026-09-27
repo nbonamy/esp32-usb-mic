@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_check.h"
 #include "esp_heap_caps.h"
@@ -28,6 +29,7 @@ static esp_lcd_panel_handle_t panel;
 static SemaphoreHandle_t transfer_done;
 static uint16_t *dma_stripe;
 static display_idle_capture_cb_t idle_capture_cb;
+static display_pause_cb_t pause_cb;
 
 // Recent 10 ms audio peaks travel from the center toward both screen edges.
 // The mirrored shape follows the generated waveform concept without storing a
@@ -119,21 +121,56 @@ static void waveform_task(void *context)
 {
     (void)context;
     uint8_t levels[WAVE_PAIRS];
+    bool paused = false;
+    bool was_boot_pressed = false;
+    TickType_t last_toggle = 0;
     for (;;) {
-        if (idle_capture_cb) idle_capture_cb();
-        snapshot_history(levels);
-        esp_err_t err = draw_rows(WAVE_TOP, WAVE_BOTTOM, levels);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "waveform update stopped: %s", esp_err_to_name(err));
-            vTaskDelete(NULL);
+        bool boot_pressed = gpio_get_level(GPIO_NUM_0) == 0;
+        bool toggle = boot_pressed && !was_boot_pressed;
+        was_boot_pressed = boot_pressed;
+        TickType_t now = xTaskGetTickCount();
+        if (toggle && (TickType_t)(now - last_toggle) > pdMS_TO_TICKS(300)) {
+            esp_err_t err = pause_cb(!paused);
+            if (err == ESP_OK) {
+                paused = !paused;
+                last_toggle = now;
+                if (paused) {
+                    esp_lcd_panel_co5300_set_brightness(panel, 0);
+                    esp_lcd_panel_disp_on_off(panel, false);
+                } else {
+                    esp_lcd_panel_disp_on_off(panel, true);
+                    esp_lcd_panel_co5300_set_brightness(panel, 75);
+                    snapshot_history(levels);
+                    draw_rows(0, HEIGHT, levels);
+                }
+            } else {
+                ESP_LOGE(TAG, "pause toggle failed: %s", esp_err_to_name(err));
+            }
+        }
+        if (!paused) {
+            if (idle_capture_cb) idle_capture_cb();
+            snapshot_history(levels);
+            esp_err_t err = draw_rows(WAVE_TOP, WAVE_BOTTOM, levels);
+            if (err != ESP_OK) {
+                ESP_LOGE(TAG, "waveform update stopped: %s", esp_err_to_name(err));
+                vTaskDelete(NULL);
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(35));
     }
 }
 
-esp_err_t display_show_microphone(display_idle_capture_cb_t idle_capture)
+esp_err_t display_show_microphone(display_idle_capture_cb_t idle_capture,
+                                  display_pause_cb_t set_paused)
 {
     idle_capture_cb = idle_capture;
+    pause_cb = set_paused;
+    gpio_config_t boot_button = {
+        .pin_bit_mask = 1ULL << GPIO_NUM_0,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&boot_button), TAG, "BOOT button");
     transfer_done = xSemaphoreCreateBinary();
     ESP_RETURN_ON_FALSE(transfer_done, ESP_ERR_NO_MEM, TAG, "display semaphore");
     dma_stripe = heap_caps_malloc(WIDTH * STRIPE_HEIGHT * sizeof(uint16_t),
