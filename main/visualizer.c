@@ -15,6 +15,7 @@
 #define RING_BASE_RADIUS 130
 #define WATERFALL_ROWS 32
 #define FAN_SPOKES 48
+#define SCOPE_POINTS 96
 
 static portMUX_TYPE audio_guard = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t latest_height;
@@ -39,7 +40,7 @@ static int16_t ribbon_bottom[3][VISUALIZER_WIDTH];
 static uint8_t ring_outer_radius[RING_POINTS];
 static uint16_t ring_colors[RING_POINTS][16];
 static uint8_t angle_lut[256];
-static int16_t scope_y[3][AUDIO_COUNT];
+static int16_t scope_y[3][SCOPE_POINTS];
 static uint8_t fan_radius[FAN_SPOKES];
 static uint16_t fan_color[FAN_SPOKES];
 static float spectrum_coefficients[SPECTRUM_COUNT];
@@ -130,7 +131,7 @@ void visualizer_init(void)
     }
     for (int i = 0; i < WAVE_BARS; ++i) frame_hues[i] = ribbon_colors[0];
     for (int layer = 0; layer < 3; ++layer) {
-        for (int i = 0; i < AUDIO_COUNT; ++i) scope_y[layer][i] = 224;
+        for (int i = 0; i < SCOPE_POINTS; ++i) scope_y[layer][i] = 224;
     }
 }
 
@@ -227,13 +228,21 @@ static void prepare_ring(void)
 static void prepare_scope(void)
 {
     memmove(scope_y[1], scope_y[0], 2 * sizeof(scope_y[0]));
-    int peak = 4000;
+    int peak = 2500;
     for (int i = 0; i < AUDIO_COUNT; ++i) {
         int value = magnitude(frame_audio[i]);
         if (value > peak) peak = value;
     }
-    for (int i = 0; i < AUDIO_COUNT; ++i) {
-        scope_y[0][i] = 224 + frame_audio[i] * 100 / peak;
+    for (int i = 0; i < SCOPE_POINTS; ++i) {
+        int sample = i * (AUDIO_COUNT - 1) / (SCOPE_POINTS - 1);
+        int before = sample ? sample - 1 : sample;
+        int after = sample + 1 < AUDIO_COUNT ? sample + 1 : sample;
+        int averaged = (frame_audio[before] + frame_audio[sample] +
+                        frame_audio[after]) / 3;
+        int offset = averaged * 135 / peak;
+        if (offset > 125) offset = 125;
+        if (offset < -125) offset = -125;
+        scope_y[0][i] = 224 + offset;
     }
 }
 
@@ -422,22 +431,24 @@ static void visual_pixel(uint16_t *pixels, int top, int rows,
 
 static void scope_line(uint16_t *pixels, int top, int rows,
                        int x0, int y0, int x1, int y1,
-                       uint16_t color, bool bright)
+                       uint16_t color, bool bold)
 {
-    if ((y0 < top - 1 && y1 < top - 1) ||
-        (y0 >= top + rows + 1 && y1 >= top + rows + 1)) return;
+    if ((y0 < top - 2 && y1 < top - 2) ||
+        (y0 >= top + rows + 2 && y1 >= top + rows + 2)) return;
     int dx = abs(x1 - x0);
     int dy = -abs(y1 - y0);
     int sx = x0 < x1 ? 1 : -1;
     int sy = y0 < y1 ? 1 : -1;
     int error = dx + dy;
     for (;;) {
-        if (bright) {
-            uint16_t glow = dim_color(color, 2);
-            visual_pixel(pixels, top, rows, x0, y0 - 1, glow);
-            visual_pixel(pixels, top, rows, x0, y0 + 1, glow);
+        if (bold) {
+            for (int column = x0 - 2; column <= x0 + 2; ++column) {
+                fill_column(pixels, top, rows, column, y0 - 2, y0 + 2,
+                            color);
+            }
+        } else {
+            visual_pixel(pixels, top, rows, x0, y0, color);
         }
-        visual_pixel(pixels, top, rows, x0, y0, color);
         if (x0 == x1 && y0 == y1) break;
         int doubled = error * 2;
         if (doubled >= dy) { error += dy; x0 += sx; }
@@ -451,15 +462,28 @@ static void draw_scope_stripe(uint16_t *pixels, int top, int rows)
         fill_column(pixels, top, rows, x, 224, 224, 0x0841);
     }
     for (int trail = 2; trail >= 0; --trail) {
-        for (int i = 0; i < AUDIO_COUNT - 1; ++i) {
-            int x0 = 12 + i * 344 / (AUDIO_COUNT - 1);
-            int x1 = 12 + (i + 1) * 344 / (AUDIO_COUNT - 1);
+        for (int i = 0; i < SCOPE_POINTS - 1; ++i) {
+            int x0 = 12 + i * 344 / (SCOPE_POINTS - 1);
+            int x1 = 12 + (i + 1) * 344 / (SCOPE_POINTS - 1);
             uint16_t hue = palette_color(ribbon_colors, 8,
-                                         i * 8 * 256 / AUDIO_COUNT);
+                                         i * 8 * 256 / SCOPE_POINTS);
             uint16_t color = trail == 0 ? hue :
-                             dim_color(hue, trail == 1 ? 2 : 3);
+                             dim_color(hue, trail == 2 ? 2 : 1);
             scope_line(pixels, top, rows, x0, scope_y[trail][i],
                        x1, scope_y[trail][i + 1], color, trail == 0);
+        }
+    }
+    for (int i = 0; i < SCOPE_POINTS; ++i) {
+        int x = 12 + i * 344 / (SCOPE_POINTS - 1);
+        int y = scope_y[0][i];
+        uint16_t hue = palette_color(ribbon_colors, 8,
+                                     i * 8 * 256 / SCOPE_POINTS);
+        uint16_t halo = dim_color(hue, 3);
+        for (int column = x - 4; column <= x + 4; ++column) {
+            fill_column(pixels, top, rows, column, y - 4, y + 4, halo);
+        }
+        for (int column = x - 3; column <= x + 3; ++column) {
+            fill_column(pixels, top, rows, column, y - 3, y + 3, hue);
         }
     }
 }

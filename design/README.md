@@ -24,6 +24,6 @@ The three generated concept prompts were:
 
 ## Firmware renderer preview
 
-Left to right: scrolling colored waveform, fading spectrum, shaded aurora ribbon, slim-rimmed frequency circle, spectral waterfall, live oscilloscope, and radial frequency fan. Each panel is one native-size frame.
+Left to right: scrolling colored waveform, fading spectrum, shaded aurora ribbon, slim-rimmed frequency circle, spectral waterfall, bold-stroke oscilloscope, and radial frequency fan. Each panel is one native-size frame.
 
 ![Seven firmware-rendered modes](rendered-preview.png)
