@@ -69,18 +69,18 @@ static void display_task(void *context)
     bool paused = false;
     bool was_boot_pressed = false;
     TickType_t last_toggle = 0;
+    TickType_t last_spectrum_frame = 0;
     unsigned mode = 0;
     uint32_t frame_number = 0;
     for (;;) {
         bool boot_pressed = gpio_get_level(GPIO_NUM_0) == 0;
-        bool toggle = boot_pressed && !was_boot_pressed;
+        bool change_mode = boot_pressed && !was_boot_pressed;
         was_boot_pressed = boot_pressed;
         TickType_t now = xTaskGetTickCount();
-        if (toggle && (TickType_t)(now - last_toggle) > pdMS_TO_TICKS(300)) {
+        if (power_button_take_short_press()) {
             esp_err_t err = pause_cb(!paused);
             if (err == ESP_OK) {
                 paused = !paused;
-                last_toggle = now;
                 if (paused) {
                     esp_lcd_panel_co5300_set_brightness(panel, 0);
                     esp_lcd_panel_disp_on_off(panel, false);
@@ -92,18 +92,24 @@ static void display_task(void *context)
                 ESP_LOGE(TAG, "pause toggle failed: %s", esp_err_to_name(err));
             }
         }
-        bool pwr_pressed = power_button_take_short_press();
         if (!paused) {
-            if (pwr_pressed) {
+            if (change_mode &&
+                (TickType_t)(now - last_toggle) > pdMS_TO_TICKS(300)) {
                 mode = (mode + 1) % VISUALIZER_MODE_COUNT;
+                last_toggle = now;
+                last_spectrum_frame = 0;
                 ESP_LOGI(TAG, "visualization mode %u", mode);
             }
             if (idle_capture_cb) idle_capture_cb();
-            visualizer_prepare(mode, frame_number++);
-            esp_err_t err = draw_rows(VISUAL_TOP, VISUAL_BOTTOM);
-            if (err != ESP_OK) {
-                ESP_LOGE(TAG, "waveform update stopped: %s", esp_err_to_name(err));
-                vTaskDelete(NULL);
+            if (mode != 1 || last_spectrum_frame == 0 ||
+                (TickType_t)(now - last_spectrum_frame) >= pdMS_TO_TICKS(100)) {
+                visualizer_prepare(mode, frame_number++);
+                esp_err_t err = draw_rows(VISUAL_TOP, VISUAL_BOTTOM);
+                if (err != ESP_OK) {
+                    ESP_LOGE(TAG, "visualizer update stopped: %s", esp_err_to_name(err));
+                    vTaskDelete(NULL);
+                }
+                if (mode == 1) last_spectrum_frame = now;
             }
         }
         vTaskDelay(pdMS_TO_TICKS(15));

@@ -11,7 +11,9 @@
 #define AUDIO_COUNT 240
 #define SPECTRUM_COUNT 12
 #define RING_POINTS 256
-#define RING_BASE_RADIUS 94
+#define RING_INNER_RADIUS 116
+#define RING_BASE_RADIUS 130
+#define WATERFALL_ROWS 32
 
 static portMUX_TYPE audio_guard = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t latest_height;
@@ -20,19 +22,22 @@ static int16_t latest_audio[AUDIO_COUNT];
 
 // Prepared once per display frame. Only the display task reads these fields.
 static uint8_t frame_history[WAVE_BARS];
+static uint16_t frame_hues[WAVE_BARS];
 static int16_t frame_audio[AUDIO_COUNT];
 static uint8_t bands[SPECTRUM_COUNT];
+static uint8_t spectrum_glow[SPECTRUM_COUNT][16];
+static uint8_t spectrum_levels[SPECTRUM_COUNT];
+static uint8_t waterfall[WATERFALL_ROWS][SPECTRUM_COUNT];
+static uint8_t waterfall_energy[WATERFALL_ROWS];
 static uint8_t loudness;
 static unsigned current_mode;
 static uint32_t phase;
 static int16_t sine_lut[256];
 static int16_t ribbon_top[3][VISUALIZER_WIDTH];
 static int16_t ribbon_bottom[3][VISUALIZER_WIDTH];
-static int16_t ring_base_x[RING_POINTS];
-static int16_t ring_base_y[RING_POINTS];
-static int16_t ring_edge_x[RING_POINTS];
-static int16_t ring_edge_y[RING_POINTS];
-static uint16_t ring_colors[RING_POINTS];
+static uint8_t ring_outer_radius[RING_POINTS];
+static uint16_t ring_colors[RING_POINTS][16];
+static uint8_t angle_lut[256];
 static float spectrum_coefficients[SPECTRUM_COUNT];
 
 static const uint8_t spectrum_bins[SPECTRUM_COUNT] = {
@@ -44,6 +49,10 @@ static const uint16_t spectrum_colors[SPECTRUM_COUNT] = {
 };
 static const uint16_t ribbon_colors[8] = {
     0x07FF, 0x063F, 0x347F, 0xA19F, 0xF81F, 0xF86F, 0xFC40, 0xFD52,
+};
+static const uint16_t ring_palette[8] = {
+    0x07E0, 0x07FF, 0x001F, 0x781F,
+    0xF81F, 0xF800, 0xFFE0, 0xAFE0,
 };
 static int magnitude(int16_t sample)
 {
@@ -93,20 +102,29 @@ static uint16_t blend_color(uint16_t first, uint16_t second, unsigned fraction)
     return (uint16_t)((red << 11) | (green << 5) | blue);
 }
 
+static uint16_t palette_color(const uint16_t *palette, unsigned count,
+                              unsigned position)
+{
+    unsigned index = (position >> 8) % count;
+    unsigned next = (index + 1) % count;
+    return blend_color(palette[index], palette[next], position & 255);
+}
+
 void visualizer_init(void)
 {
     for (int i = 0; i < 256; ++i) {
         sine_lut[i] = (int16_t)lroundf(sinf((2.0f * 3.14159265f * i) / 256.0f) *
                                        1024.0f);
     }
-    for (int angle = 0; angle < RING_POINTS; ++angle) {
-        ring_base_x[angle] = 184 + RING_BASE_RADIUS * wave(angle + 64) / 1024;
-        ring_base_y[angle] = 224 + RING_BASE_RADIUS * wave(angle) / 1024;
-    }
     for (int i = 0; i < SPECTRUM_COUNT; ++i) {
         spectrum_coefficients[i] = 2.0f * cosf(2.0f * 3.14159265f *
                                               spectrum_bins[i] / AUDIO_COUNT);
     }
+    for (int i = 0; i < 256; ++i) {
+        angle_lut[i] = (uint8_t)lroundf(atanf(i / 255.0f) * 128.0f /
+                                         3.14159265f);
+    }
+    for (int i = 0; i < WAVE_BARS; ++i) frame_hues[i] = ribbon_colors[0];
 }
 
 void visualizer_record_audio(const int16_t *samples, size_t count)
@@ -150,9 +168,15 @@ static void prepare_spectrum(void)
                           (0.8f + band * 0.10f);
         uint8_t target = 0;
         while (target < 16 && amplitude > thresholds[target]) ++target;
+        spectrum_levels[band] = target;
         // Fast attack and slower fall keep speech from flickering excessively.
         if (target >= bands[band]) bands[band] = target;
         else if (bands[band]) --bands[band];
+        for (int cell = 0; cell < 16; ++cell) {
+            uint8_t *glow = &spectrum_glow[band][cell];
+            if (cell < target) *glow = 64;
+            else *glow = *glow > 8 ? *glow - 8 : 0;
+        }
     }
 }
 
@@ -182,13 +206,29 @@ static void prepare_ring(void)
         unsigned next = (band + 1) % SPECTRUM_COUNT;
         unsigned level = (bands[band] * (RING_POINTS - fraction) +
                           bands[next] * fraction) / RING_POINTS;
-        unsigned radius = RING_BASE_RADIUS + level * 4;
-        ring_edge_x[angle] = 184 + radius * wave(angle + 64) / 1024;
-        ring_edge_y[angle] = 224 + radius * wave(angle) / 1024;
-        uint16_t hue = blend_color(spectrum_colors[band],
-                                   spectrum_colors[next], fraction);
-        ring_colors[angle] = scale_color(hue, 36 + level * 28 / 16);
+        unsigned outer_radius = RING_BASE_RADIUS + level * 2;
+        if (outer_radius > 158) outer_radius = 158;
+        ring_outer_radius[angle] = outer_radius;
+        uint16_t hue = palette_color(ring_palette, 8, angle * 8);
+        for (int shade = 0; shade < 16; ++shade) {
+            ring_colors[angle][shade] = blend_color(0xFFFF, hue,
+                                                    shade * 256 / 15);
+        }
     }
+}
+
+static void prepare_waterfall(void)
+{
+    memmove(waterfall[1], waterfall[0],
+            sizeof(waterfall) - sizeof(waterfall[0]));
+    memmove(waterfall_energy + 1, waterfall_energy,
+            sizeof(waterfall_energy) - sizeof(waterfall_energy[0]));
+    memcpy(waterfall[0], spectrum_levels, sizeof(waterfall[0]));
+    uint8_t energy = 0;
+    for (int band = 0; band < SPECTRUM_COUNT; ++band) {
+        if (spectrum_levels[band] > energy) energy = spectrum_levels[band];
+    }
+    waterfall_energy[0] = energy;
 }
 
 void visualizer_prepare(unsigned mode, uint32_t frame_number)
@@ -204,11 +244,16 @@ void visualizer_prepare(unsigned mode, uint32_t frame_number)
     // One bar advances per display frame, regardless of the 10 ms audio rate.
     // The tallest peak since the previous frame enters from the right.
     memmove(frame_history, frame_history + 1, WAVE_BARS - 1);
+    memmove(frame_hues, frame_hues + 1,
+            (WAVE_BARS - 1) * sizeof(frame_hues[0]));
     frame_history[WAVE_BARS - 1] = new_bar > 2 ? new_bar : 2;
+    frame_hues[WAVE_BARS - 1] = palette_color(ribbon_colors, 8,
+                                              frame_number * 24);
     loudness = current_height;
-    if (current_mode == 1 || current_mode == 3) prepare_spectrum();
+    if (current_mode == 1 || current_mode == 3 || current_mode == 4) prepare_spectrum();
     if (current_mode == 2) prepare_ribbons();
     if (current_mode == 3) prepare_ring();
+    if (current_mode == 4) prepare_waterfall();
 }
 
 static void fill_column(uint16_t *pixels, int top, int rows,
@@ -225,7 +270,7 @@ static void fill_column(uint16_t *pixels, int top, int rows,
 static void draw_waveform_stripe(uint16_t *pixels, int top, int rows)
 {
     for (int x = 12; x < 356; ++x) {
-        uint16_t hue = ribbon_colors[(x * 6) / VISUALIZER_WIDTH];
+        uint16_t hue = frame_hues[x / 6];
         fill_column(pixels, top, rows, x, 223, 225, dim_color(hue, 3));
     }
     for (int bar = 0; bar < WAVE_BARS; ++bar) {
@@ -233,7 +278,7 @@ static void draw_waveform_stripe(uint16_t *pixels, int top, int rows)
         for (int lane = 0; lane <= 4; ++lane) {
             int x = bar * 6 + lane;
             if (x >= VISUALIZER_WIDTH) break;
-            uint16_t hue = ribbon_colors[(x * 6) / VISUALIZER_WIDTH];
+            uint16_t hue = frame_hues[bar];
             int outer_top = 224 - height - 7;
             int outer_bottom = 224 + height + 7;
             if (outer_top < 112) outer_top = 112;
@@ -256,14 +301,17 @@ static void draw_spectrum_stripe(uint16_t *pixels, int top, int rows)
 {
     for (int band = 0; band < SPECTRUM_COUNT; ++band) {
         int left = 22 + band * 27;
-        for (int cell = 0; cell < bands[band]; ++cell) {
+        for (int cell = 0; cell < 16; ++cell) {
+            uint8_t glow = spectrum_glow[band][cell];
+            if (!glow) continue;
             int first_y = 367 - cell * 18;
             int last_y = 379 - cell * 18;
             if (first_y < top) first_y = top;
             if (last_y >= top + rows) last_y = top + rows - 1;
+            uint16_t color = scale_color(spectrum_colors[band], glow);
             for (int x = left; x < left + 19; ++x) {
                 fill_column(pixels, top, rows, x, first_y, last_y,
-                            spectrum_colors[band]);
+                            color);
             }
         }
     }
@@ -271,48 +319,60 @@ static void draw_spectrum_stripe(uint16_t *pixels, int top, int rows)
 
 static void draw_ribbons_stripe(uint16_t *pixels, int top, int rows)
 {
+    for (int x = 12; x < VISUALIZER_WIDTH - 12; ++x) {
+        uint16_t hue = palette_color(ribbon_colors, 8,
+                                     (unsigned)x * 8 * 256 / VISUALIZER_WIDTH);
+        fill_column(pixels, top, rows, x, 224, 224, dim_color(hue, 3));
+    }
     for (int layer = 0; layer < 3; ++layer) {
         for (int x = 0; x < VISUALIZER_WIDTH; ++x) {
             int first_y = ribbon_top[layer][x];
             int last_y = ribbon_bottom[layer][x];
             if (first_y < 88) first_y = 88;
             if (last_y > 359) last_y = 359;
-            uint16_t hue = ribbon_colors[(x * 8 / VISUALIZER_WIDTH + layer) % 8];
+            int center = (first_y + last_y) / 2;
+            int half = (last_y - first_y) / 2;
+            uint16_t hue = palette_color(ribbon_colors, 8,
+                (unsigned)x * 8 * 256 / VISUALIZER_WIDTH + layer * 256);
             fill_column(pixels, top, rows, x, first_y, last_y,
-                        dim_color(hue, 2));
-            fill_column(pixels, top, rows, x, first_y, first_y + 2, hue);
-            fill_column(pixels, top, rows, x, last_y - 2, last_y, hue);
+                        dim_color(hue, 3));
+            fill_column(pixels, top, rows, x, center - half * 2 / 3,
+                        center + half * 2 / 3, dim_color(hue, 2));
+            fill_column(pixels, top, rows, x, center - half / 3,
+                        center + half / 3, dim_color(hue, 1));
+            fill_column(pixels, top, rows, x, center, center, hue);
         }
     }
 }
 
-static void ring_stripe_pixel(uint16_t *pixels, int top, int rows,
-                              int x, int y, uint16_t color)
+static unsigned ring_angle(int dx, int dy)
 {
-    if (x < 0 || x >= VISUALIZER_WIDTH || y < top || y >= top + rows) return;
-    pixels[(y - top) * VISUALIZER_WIDTH + x] = color;
+    unsigned ax = abs(dx);
+    unsigned ay = abs(dy);
+    unsigned quarter = ax >= ay ?
+        angle_lut[ay * 255 / ax] : 64 - angle_lut[ax * 255 / ay];
+    if (dx >= 0) return dy >= 0 ? quarter : (256 - quarter) & 255;
+    return dy >= 0 ? 128 - quarter : 128 + quarter;
 }
 
-static void ring_stripe_line(uint16_t *pixels, int top, int rows,
-                             int x0, int y0, int x1, int y1, uint16_t color)
+static void draw_waterfall_stripe(uint16_t *pixels, int top, int rows)
 {
-    if ((y0 < top - 1 && y1 < top - 1) ||
-        (y0 > top + rows && y1 > top + rows)) return;
-    int dx = abs(x1 - x0);
-    int dy = -abs(y1 - y0);
-    int sx = x0 < x1 ? 1 : -1;
-    int sy = y0 < y1 ? 1 : -1;
-    int error = dx + dy;
-    for (;;) {
-        ring_stripe_pixel(pixels, top, rows, x0, y0, color);
-        ring_stripe_pixel(pixels, top, rows, x0 - 1, y0, color);
-        ring_stripe_pixel(pixels, top, rows, x0 + 1, y0, color);
-        ring_stripe_pixel(pixels, top, rows, x0, y0 - 1, color);
-        ring_stripe_pixel(pixels, top, rows, x0, y0 + 1, color);
-        if (x0 == x1 && y0 == y1) break;
-        int doubled = 2 * error;
-        if (doubled >= dy) { error += dy; x0 += sx; }
-        if (doubled <= dx) { error += dx; y0 += sy; }
+    for (int row = 0; row < WATERFALL_ROWS; ++row) {
+        int first_y = 64 + row * 10;
+        int last_y = first_y + 7;
+        if (last_y < top || first_y >= top + rows) continue;
+        unsigned energy = waterfall_energy[row];
+        if (!energy) continue;
+        for (int band = 0; band < SPECTRUM_COUNT; ++band) {
+            unsigned level = waterfall[row][band];
+            unsigned brightness = (8 + energy + level * 2) *
+                                  (64 - row / 2) / 64;
+            uint16_t color = scale_color(spectrum_colors[band], brightness);
+            int left = 22 + band * 27;
+            for (int x = left; x < left + 23; ++x) {
+                fill_column(pixels, top, rows, x, first_y, last_y, color);
+            }
+        }
     }
 }
 
@@ -331,20 +391,29 @@ void visualizer_draw_stripe(uint16_t *pixels, int top, int rows)
         draw_ribbons_stripe(pixels, top, rows);
         return;
     }
-    // The quiet circle remains visible; frequency energy lifts its colored
-    // edge outward at the corresponding angle.
-    for (int angle = 0; angle < RING_POINTS; ++angle) {
-        int next = (angle + 1) % RING_POINTS;
-        ring_stripe_line(pixels, top, rows,
-                         ring_base_x[angle], ring_base_y[angle],
-                         ring_base_x[next], ring_base_y[next],
-                         dim_color(ring_colors[angle], 2));
+    if (current_mode == 4) {
+        draw_waterfall_stripe(pixels, top, rows);
+        return;
     }
-    for (int angle = 0; angle < RING_POINTS; ++angle) {
-        int next = (angle + 1) % RING_POINTS;
-        ring_stripe_line(pixels, top, rows,
-                         ring_edge_x[angle], ring_edge_y[angle],
-                         ring_edge_x[next], ring_edge_y[next],
-                         ring_colors[angle]);
+    // Rasterize only the annulus, using a small integer angle lookup. This
+    // leaves a solid white inner rim and has no gaps between radial spokes.
+    for (int y = top; y < top + rows; ++y) {
+        int dy = y - 224;
+        if (abs(dy) > 158) continue;
+        int extent = (int)sqrtf(158 * 158 - dy * dy);
+        for (int x = 184 - extent; x <= 184 + extent; ++x) {
+            int dx = x - 184;
+            int radius_squared = dx * dx + dy * dy;
+            if (radius_squared < RING_INNER_RADIUS * RING_INNER_RADIUS) continue;
+            unsigned angle = ring_angle(dx, dy);
+            int outer = ring_outer_radius[angle];
+            if (radius_squared > outer * outer) continue;
+            int start = RING_INNER_RADIUS + 8;
+            int shade = radius_squared <= start * start ? 0 :
+                (radius_squared - start * start) * 15 /
+                (outer * outer - start * start);
+            pixels[(y - top) * VISUALIZER_WIDTH + x] =
+                ring_colors[angle][shade];
+        }
     }
 }

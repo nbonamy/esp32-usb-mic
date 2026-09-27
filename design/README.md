@@ -1,6 +1,6 @@
 # Visualizer concepts
 
-These images were generated with imagegen as design references. The firmware does not store or display the PNGs; it draws the four live modes in RGB565. `rendered-preview.png` was generated from the actual C renderer using synthetic microphone samples at the board's 368 × 448 resolution. It is a software preview, not a photo of the board. The orbit mesh concept was explored but replaced by a simpler frequency-reactive circle after on-device testing.
+These images were generated with imagegen as design references. The firmware does not store or display the PNGs; it draws the five live modes in RGB565. `rendered-preview.png` was generated from the actual C renderer using synthetic microphone samples at the board's 368 × 448 resolution. It is a software preview, not a photo of the board. The orbit mesh concept was explored but replaced by a simpler frequency-reactive circle after on-device testing.
 
 The three generated concept prompts were:
 
@@ -24,6 +24,6 @@ The three generated concept prompts were:
 
 ## Firmware renderer preview
 
-Left to right: scrolling colored waveform, spectrum, aurora ribbon, and frequency-reactive circle. Each panel is one native-size frame.
+Left to right: scrolling colored waveform, fading spectrum, shaded aurora ribbon, white-rimmed frequency circle, and spectral waterfall. Each panel is one native-size frame.
 
-![Four firmware-rendered modes](rendered-preview.png)
+![Five firmware-rendered modes](rendered-preview.png)
