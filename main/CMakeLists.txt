@@ -1,4 +1,4 @@
-idf_component_register(SRCS "main.c" "display.c" "serial_control.c" "codec/es8311.c"
+idf_component_register(SRCS "main.c" "display.c" "visualizer.c" "power_button.c" "serial_control.c" "codec/es8311.c"
                        INCLUDE_DIRS "." "codec"
                        REQUIRES driver esp_driver_i2c esp_driver_i2s esp_driver_gpio
                                 esp_driver_spi esp_lcd usb_device_uac

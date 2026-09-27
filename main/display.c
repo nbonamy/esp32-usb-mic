@@ -15,14 +15,14 @@
 #include "freertos/semphr.h"
 #include "freertos/task.h"
 
-#define WIDTH 368
-#define HEIGHT 448
-#define STRIPE_HEIGHT 16
-#define WAVE_TOP 112
-#define WAVE_BOTTOM 336
-#define WAVE_MIDDLE 224
-#define WAVE_PAIRS 28
-#define BAR_PITCH 6
+#include "power_button.h"
+#include "visualizer.h"
+
+#define WIDTH VISUALIZER_WIDTH
+#define HEIGHT VISUALIZER_HEIGHT
+#define STRIPE_HEIGHT 64
+#define VISUAL_TOP 64
+#define VISUAL_BOTTOM 384
 
 static const char *TAG = "mic_display";
 static esp_lcd_panel_handle_t panel;
@@ -31,62 +31,9 @@ static uint16_t *dma_stripe;
 static display_idle_capture_cb_t idle_capture_cb;
 static display_pause_cb_t pause_cb;
 
-// Recent 10 ms audio peaks travel from the center toward both screen edges.
-// The mirrored shape follows the generated waveform concept without storing a
-// large raster image in flash or moving audio samples through the display task.
-static portMUX_TYPE history_lock = portMUX_INITIALIZER_UNLOCKED;
-static uint8_t history[WAVE_PAIRS];
-static uint8_t history_head;
-
-void display_record_peak(uint16_t peak)
+void display_record_audio(const int16_t *samples, size_t count)
 {
-    // Compress the analog mic's wide level range into visible bar heights.
-    uint32_t height;
-    if (peak < 400) {
-        height = peak / 80;
-    } else if (peak < 4000) {
-        height = 5 + (peak - 400) / 55;
-    } else {
-        height = 70 + (peak - 4000) / 140;
-    }
-    if (height > 108) height = 108;
-    if (height < 2) height = 2;
-
-    portENTER_CRITICAL(&history_lock);
-    history[history_head] = (uint8_t)height;
-    history_head = (history_head + 1) % WAVE_PAIRS;
-    portEXIT_CRITICAL(&history_lock);
-}
-
-static void snapshot_history(uint8_t levels[WAVE_PAIRS])
-{
-    portENTER_CRITICAL(&history_lock);
-    for (int i = 0; i < WAVE_PAIRS; ++i) {
-        levels[i] = history[(history_head + WAVE_PAIRS - 1 - i) % WAVE_PAIRS];
-    }
-    portEXIT_CRITICAL(&history_lock);
-}
-
-static uint16_t waveform_pixel(int x, int y, const uint8_t levels[WAVE_PAIRS])
-{
-    uint16_t color = 0x0000;
-    if (y >= WAVE_TOP && y < WAVE_BOTTOM) {
-        int distance = y > WAVE_MIDDLE ? y - WAVE_MIDDLE : WAVE_MIDDLE - y;
-        int from_center = x < WIDTH / 2 ? WIDTH / 2 - 1 - x : x - WIDTH / 2;
-        int pair = from_center / BAR_PITCH;
-        int lane = from_center % BAR_PITCH;
-
-        if (x >= 12 && x < WIDTH - 12 && distance <= 1) color = 0x00C8;
-        if (pair < WAVE_PAIRS) {
-            int height = levels[pair] > 2 ? levels[pair] : 2;
-            if (lane <= 4 && distance <= height + 7) color = 0x0090;
-            if (lane <= 3 && distance <= height + 3) color = 0x11F6;
-            if (lane <= 2 && distance <= height) color = 0x4FFF;
-            if (lane <= 1 && distance <= height - 2) color = 0x9FFF;
-        }
-    }
-    // The CO5300 QSPI panel consumes RGB565 most-significant byte first.
-    return __builtin_bswap16(color);
+    visualizer_record_audio(samples, count);
 }
 
 static bool IRAM_ATTR color_done(esp_lcd_panel_io_handle_t io,
@@ -100,13 +47,12 @@ static bool IRAM_ATTR color_done(esp_lcd_panel_io_handle_t io,
     return wake == pdTRUE;
 }
 
-static esp_err_t draw_rows(int top, int bottom, const uint8_t levels[WAVE_PAIRS])
+static esp_err_t draw_rows(int top, int bottom)
 {
     for (int y = top; y < bottom; y += STRIPE_HEIGHT) {
-        for (int row = 0; row < STRIPE_HEIGHT; ++row) {
-            for (int x = 0; x < WIDTH; ++x) {
-                dma_stripe[row * WIDTH + x] = waveform_pixel(x, y + row, levels);
-            }
+        visualizer_draw_stripe(dma_stripe, y, STRIPE_HEIGHT);
+        for (int pixel = 0; pixel < WIDTH * STRIPE_HEIGHT; ++pixel) {
+            dma_stripe[pixel] = __builtin_bswap16(dma_stripe[pixel]);
         }
         ESP_RETURN_ON_ERROR(esp_lcd_panel_draw_bitmap(panel, 0, y, WIDTH,
                                                        y + STRIPE_HEIGHT,
@@ -117,13 +63,14 @@ static esp_err_t draw_rows(int top, int bottom, const uint8_t levels[WAVE_PAIRS]
     return ESP_OK;
 }
 
-static void waveform_task(void *context)
+static void display_task(void *context)
 {
     (void)context;
-    uint8_t levels[WAVE_PAIRS];
     bool paused = false;
     bool was_boot_pressed = false;
     TickType_t last_toggle = 0;
+    unsigned mode = 0;
+    uint32_t frame_number = 0;
     for (;;) {
         bool boot_pressed = gpio_get_level(GPIO_NUM_0) == 0;
         bool toggle = boot_pressed && !was_boot_pressed;
@@ -140,23 +87,26 @@ static void waveform_task(void *context)
                 } else {
                     esp_lcd_panel_disp_on_off(panel, true);
                     esp_lcd_panel_co5300_set_brightness(panel, 75);
-                    snapshot_history(levels);
-                    draw_rows(0, HEIGHT, levels);
                 }
             } else {
                 ESP_LOGE(TAG, "pause toggle failed: %s", esp_err_to_name(err));
             }
         }
+        bool pwr_pressed = power_button_take_short_press();
         if (!paused) {
+            if (pwr_pressed) {
+                mode = (mode + 1) % VISUALIZER_MODE_COUNT;
+                ESP_LOGI(TAG, "visualization mode %u", mode);
+            }
             if (idle_capture_cb) idle_capture_cb();
-            snapshot_history(levels);
-            esp_err_t err = draw_rows(WAVE_TOP, WAVE_BOTTOM, levels);
+            visualizer_prepare(mode, frame_number++);
+            esp_err_t err = draw_rows(VISUAL_TOP, VISUAL_BOTTOM);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "waveform update stopped: %s", esp_err_to_name(err));
                 vTaskDelete(NULL);
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(35));
+        vTaskDelay(pdMS_TO_TICKS(15));
     }
 }
 
@@ -224,10 +174,10 @@ esp_err_t display_show_microphone(display_idle_capture_cb_t idle_capture,
     ESP_RETURN_ON_ERROR(esp_lcd_panel_co5300_set_brightness(panel, 75),
                         TAG, "panel brightness");
 
-    uint8_t levels[WAVE_PAIRS];
-    snapshot_history(levels);
-    ESP_RETURN_ON_ERROR(draw_rows(0, HEIGHT, levels), TAG, "initial frame");
-    ESP_RETURN_ON_FALSE(xTaskCreate(waveform_task, "waveform", 6144, NULL, 2,
+    visualizer_init();
+    visualizer_prepare(0, 0);
+    ESP_RETURN_ON_ERROR(draw_rows(0, HEIGHT), TAG, "initial frame");
+    ESP_RETURN_ON_FALSE(xTaskCreate(display_task, "display", 6144, NULL, 2,
                                     NULL) == pdPASS,
                         ESP_ERR_NO_MEM, TAG, "waveform task");
     return ESP_OK;

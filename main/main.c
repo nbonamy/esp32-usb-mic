@@ -15,6 +15,7 @@
 
 #include "codec/es8311.h"
 #include "display.h"
+#include "power_button.h"
 #include "serial_control.h"
 
 #define SAMPLE_RATE 24000
@@ -56,7 +57,7 @@ static esp_err_t microphone_input(uint8_t *buffer, size_t length,
     if (err != ESP_OK || received != frames * 2 * sizeof(int16_t)) {
         memset(buffer, 0, length);
         *bytes_read = length;
-        display_record_peak(0);
+        display_record_audio(NULL, 0);
         if (++read_errors % 100 == 1) {
             ESP_LOGW(TAG, "I2S short read: %s, %u/%u bytes",
                      esp_err_to_name(err), (unsigned)received,
@@ -75,13 +76,10 @@ static esp_err_t microphone_input(uint8_t *buffer, size_t length,
     }
     const unsigned channel = energy[1] > energy[0] ? 1 : 0;
     int16_t *mono = (int16_t *)buffer;
-    uint16_t peak = 0;
     for (size_t i = 0; i < frames; ++i) {
         mono[i] = stereo[2 * i + channel];
-        unsigned magnitude = abs((int)mono[i]);
-        if (magnitude > peak) peak = magnitude;
     }
-    display_record_peak(peak);
+    display_record_audio(mono, frames);
     *bytes_read = length;
     xSemaphoreGive(audio_lock);
     return ESP_OK;
@@ -112,15 +110,18 @@ static void capture_idle_peak(void)
     }
 
     uint32_t energy[2] = {0, 0};
-    uint16_t peak[2] = {0, 0};
+    int16_t mono[FRAMES_PER_READ];
     for (size_t i = 0; i < FRAMES_PER_READ; ++i) {
         for (unsigned channel = 0; channel < 2; ++channel) {
             unsigned magnitude = abs((int)samples[2 * i + channel]);
             energy[channel] += magnitude;
-            if (magnitude > peak[channel]) peak[channel] = magnitude;
         }
     }
-    display_record_peak(peak[energy[1] > energy[0] ? 1 : 0]);
+    unsigned channel = energy[1] > energy[0] ? 1 : 0;
+    for (size_t i = 0; i < FRAMES_PER_READ; ++i) {
+        mono[i] = samples[2 * i + channel];
+    }
+    display_record_audio(mono, FRAMES_PER_READ);
     xSemaphoreGive(audio_lock);
 }
 
@@ -228,6 +229,10 @@ void app_main(void)
 {
     serial_control_init();
     ESP_ERROR_CHECK(init_audio());
+    esp_err_t power_result = power_button_init();
+    if (power_result != ESP_OK) {
+        ESP_LOGW(TAG, "PWR button unavailable: %s", esp_err_to_name(power_result));
+    }
     uac_device_config_t usb = {
         .input_cb = microphone_input,
         .mic_itf_num = 1,
