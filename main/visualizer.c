@@ -14,6 +14,7 @@
 #define RING_INNER_RADIUS 116
 #define RING_BASE_RADIUS 130
 #define WATERFALL_ROWS 32
+#define FAN_SPOKES 48
 
 static portMUX_TYPE audio_guard = portMUX_INITIALIZER_UNLOCKED;
 static uint8_t latest_height;
@@ -38,6 +39,9 @@ static int16_t ribbon_bottom[3][VISUALIZER_WIDTH];
 static uint8_t ring_outer_radius[RING_POINTS];
 static uint16_t ring_colors[RING_POINTS][16];
 static uint8_t angle_lut[256];
+static int16_t scope_y[3][AUDIO_COUNT];
+static uint8_t fan_radius[FAN_SPOKES];
+static uint16_t fan_color[FAN_SPOKES];
 static float spectrum_coefficients[SPECTRUM_COUNT];
 
 static const uint8_t spectrum_bins[SPECTRUM_COUNT] = {
@@ -125,6 +129,9 @@ void visualizer_init(void)
                                          3.14159265f);
     }
     for (int i = 0; i < WAVE_BARS; ++i) frame_hues[i] = ribbon_colors[0];
+    for (int layer = 0; layer < 3; ++layer) {
+        for (int i = 0; i < AUDIO_COUNT; ++i) scope_y[layer][i] = 224;
+    }
 }
 
 void visualizer_record_audio(const int16_t *samples, size_t count)
@@ -217,6 +224,33 @@ static void prepare_ring(void)
     }
 }
 
+static void prepare_scope(void)
+{
+    memmove(scope_y[1], scope_y[0], 2 * sizeof(scope_y[0]));
+    int peak = 4000;
+    for (int i = 0; i < AUDIO_COUNT; ++i) {
+        int value = magnitude(frame_audio[i]);
+        if (value > peak) peak = value;
+    }
+    for (int i = 0; i < AUDIO_COUNT; ++i) {
+        scope_y[0][i] = 224 + frame_audio[i] * 100 / peak;
+    }
+}
+
+static void prepare_fan(void)
+{
+    for (int spoke = 0; spoke < FAN_SPOKES; ++spoke) {
+        int band = spoke * SPECTRUM_COUNT / FAN_SPOKES;
+        int next = (band + 1) % SPECTRUM_COUNT;
+        int fraction = (spoke * SPECTRUM_COUNT) % FAN_SPOKES;
+        int level = (bands[band] * (FAN_SPOKES - fraction) +
+                     bands[next] * fraction) / FAN_SPOKES;
+        fan_radius[spoke] = 72 + level * 5;
+        fan_color[spoke] = palette_color(ring_palette, 8,
+                                        spoke * 8 * 256 / FAN_SPOKES);
+    }
+}
+
 static void prepare_waterfall(void)
 {
     memmove(waterfall[1], waterfall[0],
@@ -250,10 +284,13 @@ void visualizer_prepare(unsigned mode, uint32_t frame_number)
     frame_hues[WAVE_BARS - 1] = palette_color(ribbon_colors, 8,
                                               frame_number * 24);
     loudness = current_height;
-    if (current_mode == 1 || current_mode == 3 || current_mode == 4) prepare_spectrum();
+    if (current_mode == 1 || current_mode == 3 || current_mode == 4 ||
+        current_mode == 6) prepare_spectrum();
     if (current_mode == 2) prepare_ribbons();
     if (current_mode == 3) prepare_ring();
     if (current_mode == 4) prepare_waterfall();
+    if (current_mode == 5) prepare_scope();
+    if (current_mode == 6) prepare_fan();
 }
 
 static void fill_column(uint16_t *pixels, int top, int rows,
@@ -376,6 +413,85 @@ static void draw_waterfall_stripe(uint16_t *pixels, int top, int rows)
     }
 }
 
+static void visual_pixel(uint16_t *pixels, int top, int rows,
+                         int x, int y, uint16_t color)
+{
+    if (x < 0 || x >= VISUALIZER_WIDTH || y < top || y >= top + rows) return;
+    pixels[(y - top) * VISUALIZER_WIDTH + x] = color;
+}
+
+static void scope_line(uint16_t *pixels, int top, int rows,
+                       int x0, int y0, int x1, int y1,
+                       uint16_t color, bool bright)
+{
+    if ((y0 < top - 1 && y1 < top - 1) ||
+        (y0 >= top + rows + 1 && y1 >= top + rows + 1)) return;
+    int dx = abs(x1 - x0);
+    int dy = -abs(y1 - y0);
+    int sx = x0 < x1 ? 1 : -1;
+    int sy = y0 < y1 ? 1 : -1;
+    int error = dx + dy;
+    for (;;) {
+        if (bright) {
+            uint16_t glow = dim_color(color, 2);
+            visual_pixel(pixels, top, rows, x0, y0 - 1, glow);
+            visual_pixel(pixels, top, rows, x0, y0 + 1, glow);
+        }
+        visual_pixel(pixels, top, rows, x0, y0, color);
+        if (x0 == x1 && y0 == y1) break;
+        int doubled = error * 2;
+        if (doubled >= dy) { error += dy; x0 += sx; }
+        if (doubled <= dx) { error += dx; y0 += sy; }
+    }
+}
+
+static void draw_scope_stripe(uint16_t *pixels, int top, int rows)
+{
+    for (int x = 12; x < 356; ++x) {
+        fill_column(pixels, top, rows, x, 224, 224, 0x0841);
+    }
+    for (int trail = 2; trail >= 0; --trail) {
+        for (int i = 0; i < AUDIO_COUNT - 1; ++i) {
+            int x0 = 12 + i * 344 / (AUDIO_COUNT - 1);
+            int x1 = 12 + (i + 1) * 344 / (AUDIO_COUNT - 1);
+            uint16_t hue = palette_color(ribbon_colors, 8,
+                                         i * 8 * 256 / AUDIO_COUNT);
+            uint16_t color = trail == 0 ? hue :
+                             dim_color(hue, trail == 1 ? 2 : 3);
+            scope_line(pixels, top, rows, x0, scope_y[trail][i],
+                       x1, scope_y[trail][i + 1], color, trail == 0);
+        }
+    }
+}
+
+static void draw_fan_stripe(uint16_t *pixels, int top, int rows)
+{
+    for (int spoke = 0; spoke < FAN_SPOKES; ++spoke) {
+        int angle = spoke * RING_POINTS / FAN_SPOKES;
+        int sine = wave(angle);
+        int cosine = wave(angle + 64);
+        int outer = fan_radius[spoke];
+        for (int radius = 24; radius <= outer; ++radius) {
+            int x = 184 + radius * cosine / 1024;
+            int y = 224 + radius * sine / 1024;
+            if (y < top - 1 || y >= top + rows + 1) continue;
+            unsigned brightness = 20 + (radius - 24) * 44 / (outer - 24);
+            uint16_t color = scale_color(fan_color[spoke], brightness);
+            visual_pixel(pixels, top, rows, x, y, color);
+            visual_pixel(pixels, top, rows, x + 1, y, dim_color(color, 1));
+            visual_pixel(pixels, top, rows, x, y + 1, dim_color(color, 1));
+        }
+    }
+    for (int dy = -9; dy <= 9; ++dy) {
+        for (int dx = -9; dx <= 9; ++dx) {
+            int distance = dx * dx + dy * dy;
+            if (distance > 81) continue;
+            uint16_t color = distance < 16 ? 0x07FF : 0x0410;
+            visual_pixel(pixels, top, rows, 184 + dx, 224 + dy, color);
+        }
+    }
+}
+
 void visualizer_draw_stripe(uint16_t *pixels, int top, int rows)
 {
     memset(pixels, 0, (size_t)rows * VISUALIZER_WIDTH * sizeof(uint16_t));
@@ -395,6 +511,14 @@ void visualizer_draw_stripe(uint16_t *pixels, int top, int rows)
         draw_waterfall_stripe(pixels, top, rows);
         return;
     }
+    if (current_mode == 5) {
+        draw_scope_stripe(pixels, top, rows);
+        return;
+    }
+    if (current_mode == 6) {
+        draw_fan_stripe(pixels, top, rows);
+        return;
+    }
     // Rasterize only the annulus, using a small integer angle lookup. This
     // leaves a solid white inner rim and has no gaps between radial spokes.
     for (int y = top; y < top + rows; ++y) {
@@ -408,7 +532,7 @@ void visualizer_draw_stripe(uint16_t *pixels, int top, int rows)
             unsigned angle = ring_angle(dx, dy);
             int outer = ring_outer_radius[angle];
             if (radius_squared > outer * outer) continue;
-            int start = RING_INNER_RADIUS + 8;
+            int start = RING_INNER_RADIUS + 3;
             int shade = radius_squared <= start * start ? 0 :
                 (radius_squared - start * start) * 15 /
                 (outer * outer - start * start);

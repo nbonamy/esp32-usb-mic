@@ -5,7 +5,7 @@
 
 #define VISUALIZER_WIDTH 368
 #define VISUALIZER_HEIGHT 448
-#define VISUALIZER_MODE_COUNT 5
+#define VISUALIZER_MODE_COUNT 7
 
 void visualizer_init(void);
 void visualizer_record_audio(const int16_t *samples, size_t count);
