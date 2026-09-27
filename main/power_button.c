@@ -11,6 +11,11 @@
 #define PMU_IRQ_ENABLE_2 0x41
 #define PMU_IRQ_STATUS_2 0x49
 #define PMU_SHORT_PRESS_BIT 0x08
+#define PMU_STATUS_1 0x00
+#define PMU_STATUS_2 0x01
+#define PMU_BATTERY_VOLTAGE_H 0x34
+#define PMU_BATTERY_VOLTAGE_L 0x35
+#define PMU_BATTERY_PERCENT 0xA4
 
 static bool available;
 
@@ -51,4 +56,22 @@ bool power_button_take_short_press(void)
     if (read_register(PMU_IRQ_STATUS_2, &status) != ESP_OK ||
         !(status & PMU_SHORT_PRESS_BIT)) return false;
     return write_register(PMU_IRQ_STATUS_2, PMU_SHORT_PRESS_BIT) == ESP_OK;
+}
+
+esp_err_t power_button_read_status(power_button_status_t *status)
+{
+    if (!status) return ESP_ERR_INVALID_ARG;
+    uint8_t first, second, high, low, percent;
+    esp_err_t err = read_register(PMU_STATUS_1, &first);
+    if (err == ESP_OK) err = read_register(PMU_STATUS_2, &second);
+    if (err == ESP_OK) err = read_register(PMU_BATTERY_VOLTAGE_H, &high);
+    if (err == ESP_OK) err = read_register(PMU_BATTERY_VOLTAGE_L, &low);
+    if (err == ESP_OK) err = read_register(PMU_BATTERY_PERCENT, &percent);
+    if (err != ESP_OK) return err;
+    status->battery_present = (first & (1 << 3)) != 0;
+    status->vbus_good = (first & (1 << 5)) != 0;
+    status->charging = (second >> 5) == 1;
+    status->battery_mv = ((uint16_t)(high & 0x1F) << 8) | low;
+    status->battery_percent = percent;
+    return ESP_OK;
 }

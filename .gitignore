@@ -5,3 +5,4 @@ sdkconfig.old
 build-output.log
 .DS_Store
 __pycache__/
+receiver/waveshare-receiver

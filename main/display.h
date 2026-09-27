@@ -17,3 +17,6 @@ esp_err_t display_show_microphone(display_idle_capture_cb_t idle_capture,
 
 // Feed a mono capture block to the visualizers. Never retains USB buffers.
 void display_record_audio(const int16_t *samples, size_t count);
+
+// Keep the panel in step with the codec and I2S capture state.
+void display_set_capture_active(bool active);

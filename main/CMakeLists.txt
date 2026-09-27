@@ -1,7 +1,8 @@
-idf_component_register(SRCS "main.c" "display.c" "visualizer.c" "power_button.c" "serial_control.c" "codec/es8311.c"
+idf_component_register(SRCS "main.c" "display.c" "visualizer.c" "power_button.c" "serial_control.c" "wireless.c" "codec/es8311.c"
                        INCLUDE_DIRS "." "codec"
                        REQUIRES driver esp_driver_i2c esp_driver_i2s esp_driver_gpio
                                 esp_driver_spi esp_lcd usb_device_uac
+                                esp_wifi esp_netif esp_event nvs_flash
                                 espressif__tinyusb espressif__esp_lcd_co5300
                                 espressif__esp_lcd_panel_io_additions)
 

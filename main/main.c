@@ -17,6 +17,7 @@
 #include "display.h"
 #include "power_button.h"
 #include "serial_control.h"
+#include "wireless.h"
 
 #define SAMPLE_RATE 24000
 #define FRAMES_PER_READ (SAMPLE_RATE / 100)  // UAC asks for 10 ms.
@@ -31,6 +32,20 @@ static bool microphone_paused;
 static int16_t stereo[FRAMES_PER_READ * 2];
 static uint32_t read_errors;
 static volatile TickType_t last_usb_capture_tick;
+
+static void stereo_to_mono(const int16_t *input, int16_t *output,
+                           size_t frames)
+{
+    uint32_t energy[2] = {0, 0};
+    for (size_t i = 0; i < frames; ++i) {
+        energy[0] += abs((int)input[2 * i]);
+        energy[1] += abs((int)input[2 * i + 1]);
+    }
+    const unsigned channel = energy[1] > energy[0] ? 1 : 0;
+    for (size_t i = 0; i < frames; ++i) {
+        output[i] = input[2 * i + channel];
+    }
+}
 
 static esp_err_t microphone_input(uint8_t *buffer, size_t length,
                                   size_t *bytes_read, void *context)
@@ -69,17 +84,10 @@ static esp_err_t microphone_input(uint8_t *buffer, size_t length,
 
     // ES8311 capture presents stereo slots. The physical mic appears in the
     // stronger slot; follow the known-good Codex Remote channel selection.
-    uint32_t energy[2] = {0, 0};
-    for (size_t i = 0; i < frames; ++i) {
-        energy[0] += abs((int)stereo[2 * i]);
-        energy[1] += abs((int)stereo[2 * i + 1]);
-    }
-    const unsigned channel = energy[1] > energy[0] ? 1 : 0;
     int16_t *mono = (int16_t *)buffer;
-    for (size_t i = 0; i < frames; ++i) {
-        mono[i] = stereo[2 * i + channel];
-    }
+    stereo_to_mono(stereo, mono, frames);
     display_record_audio(mono, frames);
+    wireless_submit(mono, frames);
     *bytes_read = length;
     xSemaphoreGive(audio_lock);
     return ESP_OK;
@@ -91,6 +99,7 @@ static void capture_idle_peak(void)
     // USB capture has priority and owns I2S while it is active.
     if ((TickType_t)(xTaskGetTickCount() - last_usb_capture_tick) <
         pdMS_TO_TICKS(100)) return;
+    if (wireless_is_streaming()) return;
 
     xSemaphoreTake(audio_lock, portMAX_DELAY);
     if (microphone_paused ||
@@ -109,30 +118,46 @@ static void capture_idle_peak(void)
         return;
     }
 
-    uint32_t energy[2] = {0, 0};
     int16_t mono[FRAMES_PER_READ];
-    for (size_t i = 0; i < FRAMES_PER_READ; ++i) {
-        for (unsigned channel = 0; channel < 2; ++channel) {
-            unsigned magnitude = abs((int)samples[2 * i + channel]);
-            energy[channel] += magnitude;
-        }
-    }
-    unsigned channel = energy[1] > energy[0] ? 1 : 0;
-    for (size_t i = 0; i < FRAMES_PER_READ; ++i) {
-        mono[i] = samples[2 * i + channel];
-    }
+    stereo_to_mono(samples, mono, FRAMES_PER_READ);
     display_record_audio(mono, FRAMES_PER_READ);
     xSemaphoreGive(audio_lock);
 }
 
-static esp_err_t set_microphone_paused(bool paused)
+static void wireless_capture_task(void *context)
 {
-    xSemaphoreTake(audio_lock, portMAX_DELAY);
-    if (microphone_paused == paused) {
+    (void)context;
+    TickType_t next = xTaskGetTickCount();
+    int16_t input[FRAMES_PER_READ * 2];
+    int16_t mono[FRAMES_PER_READ];
+    for (;;) {
+        vTaskDelayUntil(&next, pdMS_TO_TICKS(10));
+        if (!wireless_is_streaming() ||
+            (TickType_t)(xTaskGetTickCount() - last_usb_capture_tick) <
+                pdMS_TO_TICKS(100)) continue;
+        xSemaphoreTake(audio_lock, portMAX_DELAY);
+        if (microphone_paused ||
+            (TickType_t)(xTaskGetTickCount() - last_usb_capture_tick) <
+                pdMS_TO_TICKS(100)) {
+            xSemaphoreGive(audio_lock);
+            continue;
+        }
+        size_t received = 0;
+        esp_err_t err = i2s_channel_read(rx_channel, input, sizeof(input),
+                                         &received, pdMS_TO_TICKS(20));
+        if (err == ESP_OK && received == sizeof(input)) {
+            stereo_to_mono(input, mono, FRAMES_PER_READ);
+            display_record_audio(mono, FRAMES_PER_READ);
+            wireless_submit(mono, FRAMES_PER_READ);
+        }
         xSemaphoreGive(audio_lock);
-        return ESP_OK;
     }
+}
 
+// audio_lock protects both pause requests and the codec/I2S transition.
+static esp_err_t update_capture_locked(bool paused)
+{
+    if (microphone_paused == paused) return ESP_OK;
     if (paused) {
         // Refuse all further capture before touching the codec or I2S clocks.
         microphone_paused = true;
@@ -147,7 +172,6 @@ static esp_err_t set_microphone_paused(bool paused)
         if (err == ESP_OK) err = es8311_microphone_power_set(codec, true);
         if (err != ESP_OK) {
             i2s_channel_disable(rx_channel);
-            xSemaphoreGive(audio_lock);
             return err;
         }
         microphone_paused = false;
@@ -155,8 +179,32 @@ static esp_err_t set_microphone_paused(bool paused)
     }
 
     ESP_LOGI(TAG, "microphone %s", paused ? "paused" : "resumed");
-    xSemaphoreGive(audio_lock);
     return ESP_OK;
+}
+
+static esp_err_t set_microphone_paused(bool paused)
+{
+    xSemaphoreTake(audio_lock, portMAX_DELAY);
+    esp_err_t err = update_capture_locked(paused);
+    display_set_capture_active(!microphone_paused);
+    xSemaphoreGive(audio_lock);
+    if (paused) wireless_clear_audio();
+    return err;
+}
+
+static void recording_control_task(void *context)
+{
+    (void)context;
+    bool was_recording = false;
+    for (;;) {
+        bool recording = wireless_is_streaming();
+        if (recording != was_recording) {
+            esp_err_t err = set_microphone_paused(!recording);
+            if (err == ESP_OK) was_recording = recording;
+            else ESP_LOGW(TAG, "recording transition: %s", esp_err_to_name(err));
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
 }
 
 static esp_err_t init_audio(void)
@@ -229,10 +277,22 @@ void app_main(void)
 {
     serial_control_init();
     ESP_ERROR_CHECK(init_audio());
+    esp_err_t wireless_result = wireless_init();
+    if (wireless_result != ESP_OK) {
+        ESP_LOGW(TAG, "wireless microphone unavailable: %s",
+                 esp_err_to_name(wireless_result));
+    } else if (wireless_configured() &&
+               xTaskCreate(wireless_capture_task, "wifi_capture", 4096, NULL,
+                           6, NULL) != pdPASS) {
+        ESP_LOGW(TAG, "wireless capture task unavailable");
+    }
     esp_err_t power_result = power_button_init();
     if (power_result != ESP_OK) {
         ESP_LOGW(TAG, "PWR button unavailable: %s", esp_err_to_name(power_result));
     }
+    // With Wi-Fi configured, start dark and silent on either power source.
+    // The PWR button and a Mac input-open event can each turn capture on.
+    if (wireless_configured()) ESP_ERROR_CHECK(set_microphone_paused(true));
     uac_device_config_t usb = {
         .input_cb = microphone_input,
         .mic_itf_num = 1,
@@ -244,5 +304,9 @@ void app_main(void)
     if (display_result != ESP_OK) {
         ESP_LOGW(TAG, "status display unavailable: %s",
                  esp_err_to_name(display_result));
+    }
+    if (xTaskCreate(recording_control_task, "mic_control", 3072, NULL, 3,
+                    NULL) != pdPASS) {
+        ESP_LOGW(TAG, "recording control unavailable");
     }
 }

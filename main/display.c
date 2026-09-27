@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
@@ -30,6 +31,12 @@ static SemaphoreHandle_t transfer_done;
 static uint16_t *dma_stripe;
 static display_idle_capture_cb_t idle_capture_cb;
 static display_pause_cb_t pause_cb;
+static volatile bool capture_active = true;
+
+void display_set_capture_active(bool active)
+{
+    capture_active = active;
+}
 
 void display_record_audio(const int16_t *samples, size_t count)
 {
@@ -63,36 +70,48 @@ static esp_err_t draw_rows(int top, int bottom)
     return ESP_OK;
 }
 
+static esp_err_t clear_screen(void)
+{
+    memset(dma_stripe, 0, WIDTH * STRIPE_HEIGHT * sizeof(uint16_t));
+    for (int y = 0; y < HEIGHT; y += STRIPE_HEIGHT) {
+        ESP_RETURN_ON_ERROR(esp_lcd_panel_draw_bitmap(panel, 0, y, WIDTH,
+                                                       y + STRIPE_HEIGHT,
+                                                       dma_stripe), TAG, "clear panel");
+        ESP_RETURN_ON_FALSE(xSemaphoreTake(transfer_done, pdMS_TO_TICKS(500)) == pdTRUE,
+                            ESP_ERR_TIMEOUT, TAG, "clear transfer timeout");
+    }
+    return ESP_OK;
+}
+
 static void display_task(void *context)
 {
     (void)context;
-    bool paused = false;
     bool was_boot_pressed = false;
     TickType_t last_toggle = 0;
     TickType_t last_spectrum_frame = 0;
     unsigned mode = 0;
     uint32_t frame_number = 0;
+    bool panel_on = capture_active;
     for (;;) {
         bool boot_pressed = gpio_get_level(GPIO_NUM_0) == 0;
         bool change_mode = boot_pressed && !was_boot_pressed;
         was_boot_pressed = boot_pressed;
         TickType_t now = xTaskGetTickCount();
         if (power_button_take_short_press()) {
-            esp_err_t err = pause_cb(!paused);
-            if (err == ESP_OK) {
-                paused = !paused;
-                if (paused) {
-                    esp_lcd_panel_co5300_set_brightness(panel, 0);
-                    esp_lcd_panel_disp_on_off(panel, false);
-                } else {
-                    esp_lcd_panel_disp_on_off(panel, true);
-                    esp_lcd_panel_co5300_set_brightness(panel, 75);
-                }
-            } else {
+            esp_err_t err = pause_cb(capture_active);
+            if (err != ESP_OK) {
                 ESP_LOGE(TAG, "pause toggle failed: %s", esp_err_to_name(err));
             }
         }
-        if (!paused) {
+        bool should_show = capture_active;
+        if (panel_on != should_show) {
+            // A black AMOLED frame emits no light. Avoid CO5300 DISP_OFF here:
+            // this board has no hardware reset pin and has failed to recover
+            // from DISP_OFF until its power rail was fully cycled.
+            esp_err_t err = should_show ? ESP_OK : clear_screen();
+            if (err == ESP_OK) panel_on = should_show;
+        }
+        if (should_show) {
             if (change_mode &&
                 (TickType_t)(now - last_toggle) > pdMS_TO_TICKS(300)) {
                 mode = (mode + 1) % VISUALIZER_MODE_COUNT;
@@ -112,7 +131,7 @@ static void display_task(void *context)
                 if (mode == 1) last_spectrum_frame = now;
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(15));
+        vTaskDelay(pdMS_TO_TICKS(should_show ? 15 : 100));
     }
 }
 
@@ -183,6 +202,9 @@ esp_err_t display_show_microphone(display_idle_capture_cb_t idle_capture,
     visualizer_init();
     visualizer_prepare(0, 0);
     ESP_RETURN_ON_ERROR(draw_rows(0, HEIGHT), TAG, "initial frame");
+    if (!capture_active) {
+        ESP_RETURN_ON_ERROR(clear_screen(), TAG, "initial blank frame");
+    }
     ESP_RETURN_ON_FALSE(xTaskCreate(display_task, "display", 6144, NULL, 2,
                                     NULL) == pdPASS,
                         ESP_ERR_NO_MEM, TAG, "waveform task");
